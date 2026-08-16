@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 import pymupdf
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -18,27 +19,39 @@ def extract_pdf_text(file_bytes: bytes) -> dict:
     """
     Extract text from every page of a PDF.
 
-    Returns page-level text so that we preserve document structure
-    for the RAG pipeline we will build on Day 2.
+    Page-level text is preserved because TenderIQ will later
+    use page references for RAG citations and evidence.
     """
 
     try:
-        document = pymupdf.open(stream=file_bytes, filetype="pdf")
+        document = pymupdf.open(
+            stream=file_bytes,
+            filetype="pdf",
+        )
     except Exception as exc:
-        raise ValueError("The uploaded file is not a valid PDF.") from exc
+        raise ValueError(
+            "The uploaded file is not a valid PDF."
+        ) from exc
 
     pages = []
 
     try:
         for page_number, page in enumerate(document, start=1):
-            text = page.get_text("text", sort=True).strip()
+
+            raw_text = page.get_text(
+                "text",
+                sort=True,
+            ).strip()
+
+            cleaned_text = clean_text(raw_text)
 
             pages.append(
                 {
                     "page": page_number,
-                    "text": text,
+                    "text": cleaned_text,
                 }
             )
+
     finally:
         document.close()
 
@@ -55,6 +68,324 @@ def extract_pdf_text(file_bytes: bytes) -> dict:
     }
 
 
+def clean_text(text: str) -> str:
+    """
+    Clean and normalize text extracted from a PDF.
+    """
+
+    text = text.replace("\r\n", "\n")
+    text = text.replace("\r", "\n")
+    text = text.replace("\t", " ")
+
+    # Remove excessive spaces while preserving newlines.
+    text = re.sub(r"[ ]{2,}", " ", text)
+
+    # Remove spaces around newlines.
+    text = re.sub(r" *\n *", "\n", text)
+
+    # Collapse excessive blank lines.
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
+
+
+def find_value(text: str, pattern: str) -> str | None:
+    """
+    Extract a single value from a labeled field.
+
+    Example:
+    'Tender Reference: TND-2026-014'
+    """
+
+    match = re.search(
+        pattern,
+        text,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+
+    if not match:
+        return None
+
+    value = match.group(1).strip()
+
+    return value if value else None
+
+
+def extract_metadata(pages: list[dict]) -> dict:
+    """
+    Extract deterministic metadata from the tender.
+
+    Handles common variations in tender terminology while
+    keeping extraction rule-based and predictable.
+    """
+
+    full_text = "\n".join(
+        page["text"]
+        for page in pages
+        if page["text"]
+    )
+
+    # Project name
+    project_name = find_value(
+        full_text,
+        r"Project\s+Name\s*:\s*(.+)",
+    )
+
+    # Some tenders use the document title instead of
+    # an explicit "Project Name:" field.
+    if not project_name:
+        title_match = re.search(
+            r"Invitation\s+to\s+Tender\s*\n+(.+?)(?:\n|$)",
+            full_text,
+            flags=re.IGNORECASE,
+        )
+
+        if title_match:
+            project_name = title_match.group(1).strip()
+
+    # Some documents use "REQUEST FOR PROPOSAL"
+    # followed immediately by the project title.
+    if not project_name:
+        title_match = re.search(
+            r"Request\s+for\s+Proposal\s*\n+(.+?)(?:\n|$)",
+            full_text,
+            flags=re.IGNORECASE,
+        )
+
+        if title_match:
+            project_name = title_match.group(1).strip()
+
+    # Tender reference
+    tender_reference = find_value(
+        full_text,
+        r"(?:Tender\s+Reference|Tender\s+No\.?|Tender\s+Number|RFP\s+No\.?)\s*:\s*(.+)",
+    )
+
+    # Issuing organization / client
+    issuing_organization = find_value(
+        full_text,
+        r"(?:Issuing\s+Organization|Client|Employer|Procuring\s+Entity)\s*:\s*(.+)",
+    )
+
+    # Project location
+    location = find_value(
+        full_text,
+        r"(?:Project\s+Location|Project\s+Site|Location|Site)\s*:\s*(.+)",
+    )
+
+    # Submission deadline
+    submission_deadline = find_value(
+        full_text,
+        r"(?:Submission\s+Deadline|Bid\s+Submission\s+Deadline|"
+        r"Tender\s+Submission\s+Deadline)\s*:\s*(.+)",
+    )
+
+    # Contract value / project budget
+    contract_value = find_value(
+        full_text,
+        r"(?:Estimated\s+Contract\s+Value|Estimated\s+Project\s+Budget|"
+        r"Contract\s+Value|Project\s+Value|Budget)\s*:\s*(.+)",
+    )
+
+    return {
+        "project_name": project_name,
+        "tender_reference": tender_reference,
+        "issuing_organization": issuing_organization,
+        "location": location,
+        "submission_deadline": submission_deadline,
+        "contract_value": contract_value,
+    }
+
+
+def extract_requirements(pages: list[dict]) -> list[dict]:
+    """
+    Extract mandatory tender requirements while preserving
+    the page where each requirement was found.
+
+    Supports common tender formats where requirements appear
+    in a section containing a Requirement / Mandatory table.
+    """
+
+    requirements = []
+
+    for page in pages:
+        page_text = page["text"]
+
+        # Look for the mandatory requirements section.
+        section_match = re.search(
+            r"(?:Mandatory\s+Requirements|Eligibility\s+and\s+Mandatory\s+Requirements)"
+            r"(.*?)(?=\n\s*\d+\.\s+[A-Z][^\n]*|\Z)",
+            page_text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        if not section_match:
+            continue
+
+        section_text = section_match.group(1)
+
+        # Match requirement rows ending with "Yes".
+        #
+        # Example:
+        # CAC registration and valid company documentation Yes
+        #
+        # The non-greedy match prevents multiple rows from
+        # accidentally being combined.
+        matches = re.finditer(
+            r"([A-Za-z][^\n]+?)\s+(Yes|No)\s*$",
+            section_text,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+
+        for match in matches:
+            requirement = match.group(1).strip()
+            mandatory_value = match.group(2).strip().lower()
+
+            # Clean excessive whitespace.
+            requirement = re.sub(
+                r"\s+",
+                " ",
+                requirement,
+            )
+
+            # Ignore table headers.
+            if requirement.lower() in {
+                "requirement",
+                "mandatory",
+            }:
+                continue
+
+            item = {
+                "requirement": requirement,
+                "mandatory": mandatory_value == "yes",
+                "page": page["page"],
+            }
+
+            # Prevent duplicates.
+            already_exists = any(
+                existing["requirement"].lower() == requirement.lower()
+                for existing in requirements
+            )
+
+            if not already_exists:
+                requirements.append(item)
+
+    return requirements
+
+
+def extract_risks(pages: list[dict]) -> list[dict]:
+    """
+    Extract explicitly mentioned project risks and constraints
+    while preserving their source page.
+
+    Supports common tender sections such as:
+    - Key Risks and Constraints
+    - Risks and Constraints
+    - Key Risks
+    """
+
+    risks = []
+
+    for page in pages:
+        page_text = page["text"]
+
+        # Find the risks/constraints section.
+        section_match = re.search(
+            r"(?:Key\s+Risks\s+and\s+Constraints|"
+            r"Risks\s+and\s+Constraints|"
+            r"Key\s+Risks)"
+            r"(.*?)(?=\n\s*\d+\.\s+[A-Z][^\n]*|\Z)",
+            page_text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        if not section_match:
+            continue
+
+        section_text = section_match.group(1)
+
+        # Remove introductory language that is not itself a risk.
+        section_text = re.sub(
+            r"^(?:\s*Contractors?\s+should\s+account\s+for|"
+            r"\s*Bidders?\s+should\s+consider)\s+",
+            "",
+            section_text,
+            flags=re.IGNORECASE,
+        )
+
+        # Normalize whitespace.
+        section_text = re.sub(
+            r"\s+",
+            " ",
+            section_text,
+        ).strip()
+
+        # Common risk phrases.
+        #
+        # We intentionally keep this controlled rather than asking
+        # an LLM to invent or infer risks during Day 1.
+        risk_patterns = [
+            r"material price fluctuations",
+            r"inflation and fluctuations in construction material prices",
+            r"weather-related delays",
+            r"site access restrictions",
+            r"restricted access to occupied clinical areas",
+            r"procurement lead times",
+            r"long lead times for imported medical equipment",
+            r"coordination between multiple subcontractors",
+            r"utility interruptions",
+            r"coordination with hospital operations",
+        ]
+
+        for pattern in risk_patterns:
+            matches = re.finditer(
+                pattern,
+                section_text,
+                flags=re.IGNORECASE,
+            )
+
+            for match in matches:
+                risk = match.group(0).strip()
+
+                risk = re.sub(
+                    r"\s+",
+                    " ",
+                    risk,
+                )
+
+                already_exists = any(
+                    item["risk"].lower() == risk.lower()
+                    for item in risks
+                )
+
+                if not already_exists:
+                    risks.append(
+                        {
+                            "risk": risk,
+                            "page": page["page"],
+                        }
+                    )
+
+    return risks
+
+
+def extract_tender_intelligence(pages: list[dict]) -> dict:
+    """
+    Combine deterministic extraction into a structured
+    tender intelligence object.
+    """
+
+    metadata = extract_metadata(pages)
+    requirements = extract_requirements(pages)
+    risks = extract_risks(pages)
+
+    return {
+        "metadata": metadata,
+        "requirements": requirements,
+        "risks": risks,
+    }
+
+
 @app.get("/health")
 def health_check():
     return {
@@ -65,6 +396,7 @@ def health_check():
 
 @app.post("/upload")
 async def upload_tender(file: UploadFile = File(...)):
+
     if not file.filename:
         raise HTTPException(
             status_code=400,
@@ -95,16 +427,28 @@ async def upload_tender(file: UploadFile = File(...)):
 
     try:
         extracted = extract_pdf_text(file_bytes)
+        metadata = extract_metadata(extracted["pages"])
+        requirements = extract_requirements(extracted["pages"])
+        risks = extract_risks(extracted["pages"])
+
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
             detail=str(exc),
         ) from exc
 
+    intelligence = extract_tender_intelligence(
+        extracted["pages"]
+    )
+
     return {
         "filename": file.filename,
         "content_type": file.content_type,
+        "file_size": len(file_bytes),
         "page_count": extracted["page_count"],
         "text_length": len(extracted["text"]),
+        "metadata": metadata,
+        "requirements": requirements,
+        "risks": risks,
         "pages": extracted["pages"],
     }
