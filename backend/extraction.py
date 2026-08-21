@@ -1,19 +1,5 @@
-from pathlib import Path
-import re
-
 import pymupdf
-from fastapi import FastAPI, File, HTTPException, UploadFile
-
-
-app = FastAPI(
-    title="TenderIQ",
-    description="AI-powered construction tender intelligence platform",
-    version="0.1.0",
-)
-
-
-MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
-
+import re
 
 def extract_pdf_text(file_bytes: bytes) -> dict:
     """
@@ -87,11 +73,6 @@ def clean_text(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
 
     return text.strip()
-
-
-
-
-
 
 
 def find_value(text: str, pattern: str) -> str | None:
@@ -388,72 +369,4 @@ def extract_tender_intelligence(pages: list[dict]) -> dict:
         "metadata": metadata,
         "requirements": requirements,
         "risks": risks,
-    }
-
-
-@app.get("/health")
-def health_check():
-    return {
-        "status": "ok",
-        "service": "TenderIQ",
-    }
-
-
-@app.post("/upload")
-async def upload_tender(file: UploadFile = File(...)):
-
-    if not file.filename:
-        raise HTTPException(
-            status_code=400,
-            detail="No filename was provided.",
-        )
-
-    extension = Path(file.filename).suffix.lower()
-
-    if extension != ".pdf":
-        raise HTTPException(
-            status_code=400,
-            detail="Only PDF files are currently supported.",
-        )
-
-    file_bytes = await file.read()
-
-    if not file_bytes:
-        raise HTTPException(
-            status_code=400,
-            detail="The uploaded file is empty.",
-        )
-
-    if len(file_bytes) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail="The PDF is too large. Maximum size is 20 MB.",
-        )
-
-    try:
-        extracted = extract_pdf_text(file_bytes)
-        metadata = extract_metadata(extracted["pages"])
-        requirements = extract_requirements(extracted["pages"])
-        risks = extract_risks(extracted["pages"])
-
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        ) from exc
-
-    intelligence = extract_tender_intelligence(
-        extracted["pages"]
-    )
-
-    return {
-        "filename": file.filename,
-        "content_type": file.content_type,
-        "file_size": len(file_bytes),
-        "page_count": extracted["page_count"],
-        "text_length": len(extracted["text"]),
-        "metadata": metadata,
-        "requirements": requirements,
-        "risks": risks,
-        "pages": extracted["pages"],
     }
