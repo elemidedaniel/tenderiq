@@ -1,6 +1,17 @@
 import re
+import os
 from typing import Any
+
+from groq import Groq
 from processing import generate_embedding
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
+client = Groq(
+    api_key=os.getenv("GROQ_API_KEY")
+)
 
 def search_chunks(
     query: str,
@@ -339,6 +350,37 @@ def retrieve_context(
     }
 
 
+def call_llm(prompt: str) -> str:
+    """
+    Send a grounded TenderIQ prompt to the Groq LLM.
+    """
+
+    if not isinstance(prompt, str):
+        raise TypeError("Prompt must be a string.")
+
+    prompt = prompt.strip()
+
+    if not prompt:
+        raise ValueError("Prompt cannot be empty.")
+
+    response = client.chat.completions.create(
+        model="openai/gpt-oss-120b",
+        messages=[
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        temperature=0,
+    )
+
+    answer = response.choices[0].message.content
+
+    if not answer:
+        raise ValueError("The LLM returned an empty response.")
+
+    return answer.strip()
+
 
 def answer_question(
     question: str,
@@ -430,3 +472,20 @@ def answer_question(
         "retrieved_chunks": retrieved_chunks,
         "context": retrieval["context"],
     }
+    
+    
+# if __name__ == "__main__":
+#     test_question = "What are the mandatory requirements?"
+
+#     result = answer_question(
+#         question=test_question,
+#         chunks=embedded_chunks,
+#         top_k=5,
+#     )
+
+#     print("\nANSWER:")
+#     print(result["answer"])
+
+#     print("\nSOURCES:")
+#     for source in result["sources"]:
+#         print(source)
