@@ -57,7 +57,7 @@ from processing import create_chunks, embed_chunks
 from rag import answer_question
 
 
-PDF_PATH = "data/TenderIQ_Test_Tender_02.pdf"
+PDF_PATH = "../data/TenderIQ_Test_Tender_02.pdf"
 SOURCE_FILENAME = "TenderIQ_Test_Tender_02.pdf"
 
 
@@ -87,22 +87,25 @@ print(f"Chunks: {len(chunks)}")
 print(f"Embedded chunks: {len(embedded_chunks)}")
 
 
-# 5. Test questions
+
 questions = [
+    "What is the tender reference number?",
+    "Who is the client?",
+    "Where is the project located?",
+    "What is the bid submission deadline?",
+    "What are the mandatory eligibility requirements?",
+    "What documents must be submitted?",
     "What are the key risks and constraints?",
     "What is the planned construction period?",
-    "What documents are required for submission?",
-    "What are the mandatory eligibility requirements?",
+    "How will payments be made?",
     "Does the tender require a performance bond?",
 ]
 
-
-# 6. Ask TenderIQ each question
 for question in questions:
     result = answer_question(
         question=question,
         chunks=embedded_chunks,
-        top_k=3,
+        top_k=2,
     )
 
     print("\n" + "=" * 80)

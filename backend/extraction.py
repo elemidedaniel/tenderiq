@@ -259,6 +259,105 @@ def extract_requirements(pages: list[dict]) -> list[dict]:
     return requirements
 
 
+def extract_submission_documents(pages: list[dict]) -> list[dict]:
+    """Extract required tender submission documents with page references."""
+
+    documents = []
+
+    for page in pages:
+        page_text = page["text"]
+
+        section_match = re.search(
+            r"(?:Required Submission Documents|Submission Documents)"
+            r"(.*?)(?=\n\s*\d+\.\s+[A-Z]|\Z)",
+            page_text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        if not section_match:
+            continue
+
+        section_text = section_match.group(1)
+
+        # Match numbered submission items.
+        matches = re.finditer(
+            r"(?:^|\n)\s*\d+\.\s*(.+?)(?=\n\s*\d+\.|\Z)",
+            section_text,
+            flags=re.DOTALL,
+        )
+
+        for match in matches:
+            document = re.sub(r"\s+", " ", match.group(1)).strip()
+
+            if document:
+                documents.append({
+                    "document": document,
+                    "page": page["page"],
+                })
+
+    return documents
+
+
+def extract_commercial(pages: list[dict]) -> dict:
+    """Extract commercial and contractual conditions."""
+
+    full_text = "\n".join(
+        page["text"]
+        for page in pages
+        if page["text"]
+    )
+
+    return {
+        "construction_period": find_value(
+            full_text,
+            r"(?:Construction\s+Period|Contract\s+Duration)\s*:\s*(.+)",
+        ),
+
+        "payment_terms": find_value(
+            full_text,
+            r"(?:Payment\s+Terms|Payment\s+Terms\s+and\s+Conditions)\s*:\s*(.+)",
+        ),
+
+        "performance_bond": find_value(
+            full_text,
+            r"(?:Performance\s+Bond)\s*:\s*(.+)",
+        ),
+
+        "advance_payment_guarantee": find_value(
+            full_text,
+            r"(?:Advance\s+Payment\s+Guarantee)\s*:\s*(.+)",
+        ),
+    }
+    
+    
+def extract_evaluation(pages: list[dict]) -> dict:
+    """Extract tender evaluation criteria."""
+
+    full_text = "\n".join(
+        page["text"]
+        for page in pages
+        if page["text"]
+    )
+
+    evaluation = {}
+
+    criteria = {
+        "technical_capability": r"Technical\s+Capability\s*:\s*(.+)",
+        "experience": r"Experience\s*:\s*(.+)",
+        "methodology": r"Methodology\s*:\s*(.+)",
+        "programme": r"Programme\s*:\s*(.+)",
+        "safety": r"(?:Safety|Health\s+and\s+Safety)\s*:\s*(.+)",
+        "quality": r"Quality\s*:\s*(.+)",
+        "financial_capacity": r"Financial\s+Capacity\s*:\s*(.+)",
+        "commercial_value": r"Commercial\s+Value\s*:\s*(.+)",
+    }
+
+    for key, pattern in criteria.items():
+        evaluation[key] = find_value(full_text, pattern)
+
+    return evaluation
+
+
 def extract_risks(pages: list[dict]) -> list[dict]:
     """
     Extract explicitly mentioned project risks and constraints
@@ -357,16 +456,35 @@ def extract_risks(pages: list[dict]) -> list[dict]:
 
 def extract_tender_intelligence(pages: list[dict]) -> dict:
     """
-    Combine deterministic extraction into a structured
-    tender intelligence object.
+    Combine deterministic extraction into structured
+    TenderIQ intelligence.
     """
 
     metadata = extract_metadata(pages)
     requirements = extract_requirements(pages)
+    submission_documents = extract_submission_documents(pages)
     risks = extract_risks(pages)
+    commercial = extract_commercial(pages)
+    evaluation = extract_evaluation(pages)
+
+    mandatory_requirements = [
+        item
+        for item in requirements
+        if item["mandatory"]
+    ]
 
     return {
         "metadata": metadata,
-        "requirements": requirements,
+
+        "requirements": {
+            "mandatory": mandatory_requirements,
+            "all": requirements,
+            "submission_documents": submission_documents,
+        },
+
         "risks": risks,
+
+        "commercial": commercial,
+
+        "evaluation": evaluation,
     }

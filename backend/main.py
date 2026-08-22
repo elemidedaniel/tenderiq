@@ -1,5 +1,11 @@
+import os
+import uuid
 from pathlib import Path
+
 from fastapi import FastAPI, File, HTTPException, UploadFile
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 from extraction import (
     extract_pdf_text,
     extract_tender_intelligence,
@@ -12,6 +18,7 @@ from processing import (
 
 from rag import (
     search_chunks,
+    answer_question,
 )
 
 
@@ -24,7 +31,21 @@ app = FastAPI(
 
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
 
-tender_vector_store: list[dict] = []
+
+# In-memory storage for multiple tenders.
+#
+# Structure:
+# {
+#     "tender_id": {
+#         "filename": "...",
+#         "metadata": {...},
+#         "requirements": [...],
+#         "risks": [...],
+#         "pages": [...],
+#         "chunks": [...]
+#     }
+# }
+tender_vector_store: dict[str, dict] = {}
 
 
 @app.get("/health")
@@ -67,26 +88,22 @@ async def upload_tender(file: UploadFile = File(...)):
         )
 
     try:
-        # Extract PDF text and page information.
+        # 1. Extract PDF text and page information.
         extracted = extract_pdf_text(file_bytes)
 
         pages = extracted["pages"]
 
-        # Extract tender intelligence.
+        # 2. Extract tender intelligence.
         intelligence = extract_tender_intelligence(pages)
 
-        # Create source-aware chunks.
+        # 3. Create source-aware chunks.
         chunks = create_chunks(
             pages=pages,
             source_filename=file.filename,
         )
 
-        # Generate embeddings for semantic retrieval.
+        # 4. Generate embeddings for semantic retrieval.
         embedded_chunks = embed_chunks(chunks)
-
-        # Replace the current tender in memory.
-        tender_vector_store.clear()
-        tender_vector_store.extend(embedded_chunks)
 
     except ValueError as exc:
         raise HTTPException(
@@ -94,7 +111,11 @@ async def upload_tender(file: UploadFile = File(...)):
             detail=str(exc),
         ) from exc
 
-    return {
+    # 5. Generate a unique ID for this tender.
+    tender_id = f"tender_{uuid.uuid4().hex[:8]}"
+
+    # 6. Store the tender independently.
+    tender_vector_store[tender_id] = {
         "filename": file.filename,
         "content_type": file.content_type,
         "file_size": len(file_bytes),
@@ -103,14 +124,48 @@ async def upload_tender(file: UploadFile = File(...)):
         "metadata": intelligence["metadata"],
         "requirements": intelligence["requirements"],
         "risks": intelligence["risks"],
-        "chunk_count": len(chunks),
-        "chunks": chunks,
         "pages": pages,
+        "chunks": embedded_chunks,
+    }
+
+    return {
+        "tender_id": tender_id,
+        "filename": file.filename,
+        "content_type": file.content_type,
+        "file_size": len(file_bytes),
+        "page_count": extracted["page_count"],
+        "text_length": len(extracted["text"]),
+        "metadata": intelligence["metadata"],
+        "requirements": intelligence["requirements"],
+        "risks": intelligence["risks"],
+        "chunk_count": len(embedded_chunks),
+    }
+
+
+@app.get("/tenders")
+async def list_tenders():
+
+    tenders = []
+
+    for tender_id, tender in tender_vector_store.items():
+        tenders.append(
+            {
+                "tender_id": tender_id,
+                "filename": tender["filename"],
+                "page_count": tender["page_count"],
+                "chunk_count": len(tender["chunks"]),
+            }
+        )
+
+    return {
+        "count": len(tenders),
+        "tenders": tenders,
     }
 
 
 @app.post("/search")
 async def search_tender(
+    tender_id: str,
     query: str,
     top_k: int = 5,
 ):
@@ -121,19 +176,76 @@ async def search_tender(
             detail="Search query cannot be empty.",
         )
 
-    if not tender_vector_store:
+    if tender_id not in tender_vector_store:
+        raise HTTPException(
+            status_code=404,
+            detail="Tender not found.",
+        )
+
+    if top_k <= 0:
         raise HTTPException(
             status_code=400,
-            detail="No tender has been uploaded yet.",
+            detail="top_k must be greater than 0.",
         )
+
+    tender = tender_vector_store[tender_id]
 
     results = search_chunks(
         query=query,
-        chunks=tender_vector_store,
+        chunks=tender["chunks"],
         top_k=top_k,
     )
 
     return {
+        "tender_id": tender_id,
         "query": query,
         "results": results,
+    }
+
+
+@app.post("/ask")
+async def ask_tender(
+    tender_id: str,
+    question: str,
+    top_k: int = 3,
+):
+
+    if not question.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Question cannot be empty.",
+        )
+
+    if tender_id not in tender_vector_store:
+        raise HTTPException(
+            status_code=404,
+            detail="Tender not found.",
+        )
+
+    if top_k <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="top_k must be greater than 0.",
+        )
+
+    tender = tender_vector_store[tender_id]
+
+    try:
+        result = answer_question(
+            question=question,
+            chunks=tender["chunks"],
+            top_k=top_k,
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    return {
+        "tender_id": tender_id,
+        "question": question,
+        "answer": result["answer"],
+        "sources": result["sources"],
     }
